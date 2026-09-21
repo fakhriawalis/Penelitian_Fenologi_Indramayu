@@ -1,0 +1,329 @@
+// =====================================================
+// LBS INDRAMAYU
+// =====================================================
+
+var lbs = ee.FeatureCollection(
+'projects/indramayu-project-468403/assets/LBS_Indramayu'
+);
+
+Map.centerObject(lbs, 10);
+Map.addLayer(lbs, {}, 'LBS');
+
+print('Jumlah Feature', lbs.size());
+
+// =====================================================
+// GRID 250 M
+// =====================================================
+
+var grid = ee.Image.pixelLonLat()
+.sample({
+  region: lbs.geometry(),
+  scale: 250,
+  geometries: true
+});
+
+grid = grid.map(function(f){
+
+  var c = f.geometry().coordinates();
+
+  return f
+    .set('GRID_ID', f.id())
+    .set('Longitude', c.get(0))
+    .set('Latitude', c.get(1));
+});
+
+print('Jumlah Grid', grid.size());
+
+// =====================================================
+// SENTINEL-1
+// =====================================================
+
+var S1 = ee.ImageCollection(
+'COPERNICUS/S1_GRD'
+)
+.filter(
+  ee.Filter.eq('instrumentMode','IW')
+)
+.filter(
+  ee.Filter.listContains(
+    'transmitterReceiverPolarisation',
+    'VV'
+  )
+)
+.filter(
+  ee.Filter.listContains(
+    'transmitterReceiverPolarisation',
+    'VH'
+  )
+)
+.filter(
+  ee.Filter.eq(
+    'orbitProperties_pass',
+    'DESCENDING'
+  )
+);
+
+// =====================================================
+// TAMBAH RVI
+// =====================================================
+
+function addRVI(img){
+
+  var vv =
+    ee.Image(10)
+      .pow(
+        img.select('VV')
+        .divide(10)
+      );
+
+  var vh =
+    ee.Image(10)
+      .pow(
+        img.select('VH')
+        .divide(10)
+      );
+
+  var rvi =
+    vh.multiply(4)
+      .divide(
+        vv.add(vh)
+      )
+      .rename('RVI');
+
+  return img.addBands(rvi);
+}
+
+S1 = S1.map(addRVI);
+
+// =====================================================
+// SENTINEL-2
+// =====================================================
+
+var S2 = ee.ImageCollection(
+'COPERNICUS/S2_SR_HARMONIZED'
+)
+.filter(
+  ee.Filter.lt(
+    'CLOUDY_PIXEL_PERCENTAGE',
+    30
+  )
+);
+
+// =====================================================
+// CLOUD MASK
+// =====================================================
+
+function maskS2(img){
+
+  var scl = img.select('SCL');
+
+  var mask =
+      scl.neq(3)
+      .and(scl.neq(8))
+      .and(scl.neq(9))
+      .and(scl.neq(10))
+      .and(scl.neq(11));
+
+  return img.updateMask(mask);
+}
+
+S2 = S2.map(maskS2);
+
+// =====================================================
+// TAMBAH NDVI DAN NDRE
+// =====================================================
+
+function addIndices(img){
+
+  var ndvi =
+    img.normalizedDifference(
+      ['B8','B4']
+    )
+    .rename('NDVI');
+
+  var ndre =
+    img.normalizedDifference(
+      ['B8','B5']
+    )
+    .rename('NDRE');
+
+  return img
+    .addBands(ndvi)
+    .addBands(ndre);
+}
+
+S2 = S2.map(addIndices);
+
+// =====================================================
+// FUNGSI PER PERIODE
+// =====================================================
+
+function exportPeriod(period){
+
+  var start =
+    ee.Date('2025-01-01')
+    .advance(
+      (period - 1) * 15,
+      'day'
+    );
+
+  var end =
+    start.advance(
+      15,
+      'day'
+    );
+
+  var s1Col =
+    S1
+    .filterDate(start,end)
+    .filterBounds(
+      lbs.geometry()
+    );
+
+  var s2Col =
+    S2
+    .filterDate(start,end)
+    .filterBounds(
+      lbs.geometry()
+    );
+
+  var s1 =
+    ee.Image(
+      ee.Algorithms.If(
+
+        s1Col.size().gt(0),
+
+        s1Col
+          .median()
+          .clip(
+            lbs.geometry()
+          ),
+
+        ee.Image.constant([
+          -9999,
+          -9999,
+          -9999
+        ]).rename([
+          'VV',
+          'VH',
+          'RVI'
+        ])
+      )
+    );
+
+  var s2 =
+    ee.Image(
+      ee.Algorithms.If(
+
+        s2Col.size().gt(0),
+
+        s2Col
+          .median()
+          .clip(
+            lbs.geometry()
+          ),
+
+        ee.Image.constant([
+          -9999,
+          -9999
+        ]).rename([
+          'NDVI',
+          'NDRE'
+        ])
+      )
+    );
+
+  var stack =
+    ee.Image.cat([
+
+      s1.select('VV'),
+      s1.select('VH'),
+      s1.select('RVI'),
+
+      s2.select('NDVI'),
+      s2.select('NDRE')
+
+    ]);
+
+  var sample =
+    stack.sampleRegions({
+
+      collection:
+      grid,
+
+      scale:
+      250,
+
+      geometries:
+      true,
+
+      tileScale:
+      16
+    });
+
+  sample =
+    sample.map(function(f){
+
+      return f
+
+        .set(
+          'Period',
+          period
+        )
+
+        .set(
+          'Month',
+          start.get('month')
+        )
+
+        .set(
+          'StartDate',
+          start.format(
+            'YYYY-MM-dd'
+          )
+        )
+
+        .set(
+          'EndDate',
+          end.format(
+            'YYYY-MM-dd'
+          )
+        )
+
+        .set(
+          'N_S1',
+          s1Col.size()
+        )
+
+        .set(
+          'N_S2',
+          s2Col.size()
+        );
+    });
+
+  Export.table.toDrive({
+
+    collection:
+    sample,
+
+    description:
+    'Indramayu_P' + period,
+
+    folder:
+    'INDRAMAYU',
+
+    fileNamePrefix:
+    'Indramayu_P' + period,
+
+    fileFormat:
+    'CSV'
+  });
+}
+
+// =====================================================
+// BUAT 24 TASK OTOMATIS
+// =====================================================
+
+for (var p = 1; p <= 24; p++) {
+  exportPeriod(p);
+}
