@@ -1,0 +1,548 @@
+// =====================================================
+// DATA TANAM 2025
+// =====================================================
+
+var points = ee.FeatureCollection(
+'projects/indramayu-project-468403/assets/DATA_2025_FIX'
+);
+
+print('Jumlah titik', points.size());
+print('Contoh titik', points.first());
+
+Map.centerObject(points, 9);
+
+// =====================================================
+// SENTINEL-1 DESCENDING
+// =====================================================
+
+var S1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+.filter(ee.Filter.eq('instrumentMode', 'IW'))
+.filter(ee.Filter.listContains(
+  'transmitterReceiverPolarisation', 'VV'))
+.filter(ee.Filter.listContains(
+  'transmitterReceiverPolarisation', 'VH'))
+.filter(ee.Filter.eq(
+  'orbitProperties_pass',
+  'DESCENDING'
+));
+
+// =====================================================
+// TAMBAH RVI
+// =====================================================
+
+function addRVI(img){
+
+  var vv_lin = ee.Image(10).pow(
+    img.select('VV').divide(10)
+  );
+
+  var vh_lin = ee.Image(10).pow(
+    img.select('VH').divide(10)
+  );
+
+  var rvi = vh_lin.multiply(4)
+    .divide(
+      vv_lin.add(vh_lin)
+    )
+    .rename('RVI');
+
+  return img.addBands(rvi);
+}
+
+S1 = S1.map(addRVI);
+
+// =====================================================
+// SENTINEL-2
+// =====================================================
+
+var S2 = ee.ImageCollection(
+  'COPERNICUS/S2_SR_HARMONIZED'
+)
+.filter(
+  ee.Filter.lt(
+    'CLOUDY_PIXEL_PERCENTAGE',
+    30
+  )
+);
+
+// =====================================================
+// CLOUD MASK
+// =====================================================
+
+function maskS2(img){
+
+  var scl = img.select('SCL');
+
+  var mask =
+      scl.neq(3)
+      .and(scl.neq(8))
+      .and(scl.neq(9))
+      .and(scl.neq(10))
+      .and(scl.neq(11));
+
+  return img.updateMask(mask);
+}
+
+S2 = S2.map(maskS2);
+
+// =====================================================
+// TAMBAH NDVI + NDRE
+// =====================================================
+
+function addIndices(img){
+
+  var ndvi = img.normalizedDifference(
+    ['B8','B4']
+  ).rename('NDVI');
+
+  var ndre = img.normalizedDifference(
+    ['B8','B5']
+  ).rename('NDRE');
+
+  return img
+    .addBands(ndvi)
+    .addBands(ndre);
+}
+
+S2 = S2.map(addIndices);
+
+// =====================================================
+// EKSTRAK FITUR
+// =====================================================
+
+function extractFeature(
+  feature,
+  startDate,
+  endDate,
+  phaseName
+){
+
+  // =====================================
+  // TANGGAL TANAM
+  // =====================================
+
+  var tanamDate = ee.Date(
+    ee.Number(
+      feature.get('Tgl_Tanam')
+    )
+  );
+ // =====================================
+// TANGGAL KUNJUNGAN
+// =====================================
+
+var kunjungDate = ee.Date(
+  ee.Number(
+    feature.get('Tgl_Kunjun')
+  )
+);
+  // =====================================
+// SELISIH START FASE DENGAN KUNJUNGAN
+// =====================================
+
+var hstFaseKunjungan = startDate.difference(
+  kunjungDate,
+  'day'
+);
+ 
+// =====================================
+// HST ASLI LAPANGAN
+// =====================================
+
+var hstLapangan = kunjungDate.difference(
+  tanamDate,
+  'day'
+);
+
+  // =====================================
+  // S1
+  // =====================================
+  
+  var s1Col = S1
+    .filterDate(startDate, endDate)
+    .filterBounds(feature.geometry());
+
+  // =====================================
+  // S2
+  // =====================================
+
+  var s2Col = S2
+    .filterDate(startDate, endDate)
+    .filterBounds(feature.geometry());
+
+  // =====================================
+  // SAFE S1
+  // =====================================
+
+  var s1 = ee.Image(
+    ee.Algorithms.If(
+      s1Col.size().gt(0),
+
+      s1Col.median(),
+
+      ee.Image.constant([
+        -9999,
+        -9999,
+        -9999
+      ]).rename([
+        'VV',
+        'VH',
+        'RVI'
+      ])
+    )
+  );
+
+  // =====================================
+  // SAFE S2
+  // =====================================
+
+  var s2 = ee.Image(
+    ee.Algorithms.If(
+      s2Col.size().gt(0),
+
+      s2Col.median(),
+
+      ee.Image.constant([
+        -9999,
+        -9999
+      ]).rename([
+        'NDVI',
+        'NDRE'
+      ])
+    )
+  );
+
+  // =====================================
+  // STACK
+  // =====================================
+
+  var stack = ee.Image.cat([
+
+    s1.select('VV'),
+
+    s1.select('VH'),
+
+    s1.select('RVI'),
+
+    s2.select('NDVI'),
+
+    s2.select('NDRE')
+
+  ]);
+
+  // =====================================
+  // REDUCE
+  // =====================================
+
+  var values = stack.reduceRegion({
+
+    reducer: ee.Reducer.mean(),
+
+    geometry: feature.geometry(),
+
+    scale: 10,
+
+    maxPixels: 1e13
+
+  });
+
+  // =====================================
+  // OUTPUT FEATURE
+  // =====================================
+
+return ee.Feature(
+  feature.geometry(),
+  values
+)
+
+.set('OBJECTID', feature.get('OBJECTID'))
+.set('Longitude', feature.get('Longitude'))
+.set('Latitude', feature.get('Latitude'))
+.set('Desa', feature.get('Desa'))
+.set('Kecamatan', feature.get('Kecamatan'))
+.set('Tahun', feature.get('Tahun'))
+
+.set('Phase', phaseName)
+
+.set(
+  'Tgl_Tanam',
+  tanamDate.format('YYYY-MM-dd')
+)
+
+.set(
+  'Tgl_Kunjun',
+  kunjungDate.format('YYYY-MM-dd')
+)
+
+.set(
+  'HST_Lapangan',
+  hstLapangan
+)
+
+.set(
+  'StartDate',
+  startDate.format('YYYY-MM-dd')
+)
+
+.set(
+  'EndDate',
+  endDate.format('YYYY-MM-dd')
+)
+
+.set(
+  'N_S1',
+  s1Col.size()
+)
+
+.set(
+  'N_S2',
+  s2Col.size()
+);
+}
+// =====================================================
+// BARE
+// =====================================================
+
+var bare = points.map(function(f){
+
+  var phaseDate = ee.Date(
+    ee.Number(
+      f.get('Bare_Start')
+    )
+  );
+
+  var startDate = phaseDate.advance(
+    -7,
+    'day'
+  );
+
+  var endDate = phaseDate.advance(
+    7,
+    'day'
+  );
+
+  return extractFeature(
+    f,
+    startDate,
+    endDate,
+    'Bare'
+  );
+});
+
+// =====================================================
+// FLOODING
+// =====================================================
+
+var flooding = points.map(function(f){
+
+  var startDate = ee.Date(
+    ee.Number(
+      f.get('Flooding_S')
+    )
+  );
+
+  var endDate = ee.Date(
+    ee.Number(
+      f.get('Flooding_E')
+    )
+  ).advance(1,'day');
+
+  return extractFeature(
+    f,
+    startDate,
+    endDate,
+    'Flooding'
+  );
+});
+
+// =====================================================
+// EARLY VEG
+// =====================================================
+
+var earlyVeg = points.map(function(f){
+
+  var phaseDate = ee.Date(
+    ee.Number(
+      f.get('EarlyVeg_S')
+    )
+  );
+
+  var startDate = phaseDate.advance(
+    -7,
+    'day'
+  );
+
+  var endDate = phaseDate.advance(
+    7,
+    'day'
+  );
+
+  return extractFeature(
+    f,
+    startDate,
+    endDate,
+    'EarlyVeg'
+  );
+});
+
+// =====================================================
+// VEG1
+// =====================================================
+
+var veg1 = points.map(function(f){
+
+  return extractFeature(
+
+    f,
+
+    ee.Date(
+      ee.Number(
+        f.get('Veg1_Start')
+      )
+    ),
+
+    ee.Date(
+      ee.Number(
+        f.get('Veg1_End')
+      )
+    ).advance(1,'day'),
+
+    'Veg1'
+  );
+});
+
+// =====================================================
+// VEG2
+// =====================================================
+
+var veg2 = points.map(function(f){
+
+  return extractFeature(
+
+    f,
+
+    ee.Date(
+      ee.Number(
+        f.get('Veg2_Start')
+      )
+    ),
+
+    ee.Date(
+      ee.Number(
+        f.get('Veg2_End')
+      )
+    ).advance(1,'day'),
+
+    'Veg2'
+  );
+});
+
+// =====================================================
+// GEN1
+// =====================================================
+
+var gen1 = points.map(function(f){
+
+  return extractFeature(
+
+    f,
+
+    ee.Date(
+      ee.Number(
+        f.get('Gen1_Start')
+      )
+    ),
+
+    ee.Date(
+      ee.Number(
+        f.get('Gen1_End')
+      )
+    ).advance(1,'day'),
+
+    'Gen1'
+  );
+});
+
+// =====================================================
+// GEN2
+// =====================================================
+
+var gen2 = points.map(function(f){
+
+  return extractFeature(
+
+    f,
+
+    ee.Date(
+      ee.Number(
+        f.get('Gen2_Start')
+      )
+    ),
+
+    ee.Date(
+      ee.Number(
+        f.get('Gen2_End')
+      )
+    ).advance(1,'day'),
+
+    'Gen2'
+  );
+});
+
+// =====================================================
+// GABUNGKAN
+// =====================================================
+
+var allSamples = bare
+.merge(flooding)
+.merge(earlyVeg)
+.merge(veg1)
+.merge(veg2)
+.merge(gen1)
+.merge(gen2);
+
+// =====================================================
+// CEK
+// =====================================================
+
+print(
+  'Jumlah sampel akhir',
+  allSamples.size()
+);
+
+print(
+  'Contoh hasil',
+  allSamples.limit(10)
+);
+
+// =====================================================
+// EXPORT
+// =====================================================
+
+Export.table.toDrive({
+
+  collection: allSamples,
+
+  description:
+  'Fenologi_2025_MODELLING',
+
+  folder:
+  'INDRAMAYU',
+
+  fileNamePrefix:
+  'Fenologi_2025_MODELLING',
+
+  fileFormat:
+  'CSV'
+
+});
+
+print(points.first());
+print(
+  points.limit(20)
+);
+
+print(
+  'Contoh Hasil',
+  allSamples.first()
+);
+
